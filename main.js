@@ -1,52 +1,82 @@
+const FROM_UNIX_TIME_AGO = 20 * 60;
+
 function checkAndSendAlerts() {
   const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
   const config = getConfig(spreadsheet.getSheetByName('config'));
   const users = getUsersData(spreadsheet.getSheetByName('userdata'));
 
   users.forEach((user, index) => {
-    const now = new Date();
-    const lastAC = user.lastAC;
-    const alertDate = new Date(user.alertString);
-    const currentACCount = getCurrentACCount(user.username);
+    const fromUnixtime = Math.floor((new Date().getTime() / 1000) - FROM_UNIX_TIME_AGO);
+    const url = `https://kenkoooo.com/atcoder/atcoder-api/v3/from/${fromUnixtime}`;
 
-    if (currentACCount === null) {
-      // AC数の取得に失敗した場合は処理をスキップ
-      return;
+    // URLからデータを取得
+    const response = UrlFetchApp.fetch(url);
+    const data = JSON.parse(response.getContentText());
+
+    let userData = undefined;
+    for (let i = 0; i < data.length; i++) {
+      if (data[i].user_id !== user.username) {
+        continue;
+      }
+
+      console.log(data[i]);
+
+      if (data[i]["result"] == "WJ") {
+        continue;
+      }
+
+      if (CompareDate(user.lastSubmit, unixTimeToFormattedDate(data[i]["epoch_second"])) === 1) {
+        userData = data[i];
+        break;
+      } 
     }
 
-    let nextAlert = shouldAlert(now, lastAC, alertDate);
-    console.log(nextAlert);
+    const alertDate = new Date(user.alertString);
+    let nextAlert = shouldAlert(new Date(), user.lastAC, alertDate);
 
-    if (currentACCount > user.count) { // ACした場合
-      // 通知
-      sendNotification(config, `${user.username}がACしました! (count: ${currentACCount})`);
+    if (userData) {
+      console.log(userData);
 
-      // 次のアラートの時刻を、翌日の8:00に設定
-      nextAlert = now;
-      nextAlert.setDate(nextAlert.getDate() + 1);
-      nextAlert.setHours(8, 0, 0, 0); 
+      let formattedDate = unixTimeToFormattedDate(userData["epoch_second"]);
 
-      // Update spreadsheets
-      updateSpreadsheet(spreadsheet.getSheetByName('userdata'), index + 2, currentACCount, nextAlert);
-    } else if (nextAlert !== false) { // ACしてなくて、アラートを出す場合
-      // 通知
-      sendNotification(config, `${user.username}はまだACしていません！！！`);
+      if (CompareDate(user.lastSubmit, formattedDate) == 0) {
+        console.log("[checkAndSendAlerts] return;");
+        return;
+      }
 
-      // Update spreadsheets
-      updateSpreadsheet(spreadsheet.getSheetByName('userdata'), index + 2, user.count, nextAlert);
+      let message = ""
+      message += `${userData["user_id"]}が${userData["result"]}しました！\n`;
+      message += `\n`
+      message += `提出時刻: ${formattedDate}\n`
+      message += `解いた問題: ${userData["problem_id"]}\n`
+      message += `言語: ${userData["language"]}\n`
+      message += `提出URL: https://atcoder.jp/contests/${userData["contest_id"]}/submissions/${userData["id"]}`
+      
+      sendNotification(config, message);
+
+      if (userData["result"] == "AC") {
+        // 次のアラートの時刻を、翌日の8:00に設定
+        nextAlert = new Date();
+        nextAlert.setDate(nextAlert.getDate() + 1);
+        nextAlert.setHours(8, 0, 0, 0); 
+
+        // Update spreadsheets
+        updateSpreadsheet(spreadsheet.getSheetByName('userdata'), index + 2, formattedDate, formattedDate, nextAlert);
+      } else {
+        // AC以外
+        updateSpreadsheet(spreadsheet.getSheetByName('userdata'), index + 2, formattedDate, user.lastAC, nextAlert);
+      }
+    } else {
+      // アラート処理
+      if (nextAlert !== false) {
+        // 通知
+        sendNotification(config, `${user.username}はまだACしていません！！！`);
+
+        // Update spreadsheets
+        updateSpreadsheet(spreadsheet.getSheetByName('userdata'), index + 2, user.lastSubmit, user.lastAC, nextAlert);
+      }
     }
   });
-}
-
-function updateSpreadsheet(sheet, rowIndex, acCount, alertDate = null) {
-  // AC数
-  sheet.getRange(rowIndex, 2).setValue(acCount);
-  
-  // アラート日時が指定されている場合、Update
-  if (alertDate) {
-    const formattedDate = Utilities.formatDate(alertDate, Session.getScriptTimeZone(), "yyyy/MM/dd HH:mm:ss");
-    sheet.getRange(rowIndex, 4).setValue(formattedDate);
-  }
 }
 
 function getConfig(configSheet) {
@@ -59,7 +89,26 @@ function getConfig(configSheet) {
 
 function getUsersData(userdataSheet) {
   return userdataSheet.getRange(2, 1, userdataSheet.getLastRow() - 1, 4).getValues()
-    .map(([username, count, lastAC, alertString]) => ({username, count, lastAC: new Date(lastAC), alertString}));
+    .map(([username, lastSubmit, lastAC, alertString]) => ({username, lastSubmit, lastAC: new Date(lastAC), alertString}));
+}
+
+function unixTimeToFormattedDate(unixtime){
+  let date = new Date(unixtime * 1000);
+  let timeZone = "Asia/Tokyo";
+  let format = "yyyy/MM/dd HH:mm:ss";
+  
+  return Utilities.formatDate(date, timeZone, format);
+}
+
+function updateSpreadsheet(sheet, rowIndex, lastSubmit, lastAC, alertDate = null) {
+  sheet.getRange(rowIndex, 2).setValue(lastSubmit);
+  sheet.getRange(rowIndex, 3).setValue(lastAC);
+  
+  // アラート日時が指定されている場合、Update
+  if (alertDate) {
+    const formattedDate = Utilities.formatDate(alertDate, Session.getScriptTimeZone(), "yyyy/MM/dd HH:mm:ss");
+    sheet.getRange(rowIndex, 4).setValue(formattedDate);
+  }
 }
 
 function sendNotification(config, message) {
@@ -69,23 +118,6 @@ function sendNotification(config, message) {
     content: message,
   });
   UrlFetchApp.fetch(config.webhook, {method: "post", contentType: "application/json", payload});
-}
-
-function getCurrentACCount(username) {
-  const url = `https://kenkoooo.com/atcoder/atcoder-api/v3/user/ac_rank?user=${username}`;
-  try {
-    const response = UrlFetchApp.fetch(url);
-    const json = JSON.parse(response.getContentText());
-    if (json && 'count' in json) {
-      return json.count; // AC 数を返す
-    } else {
-      console.log('AC 数が取得できませんでした。');
-      return null; // AC 数の取得に失敗した場合は null を返す
-    }
-  } catch (error) {
-    console.log(`エラー: ${error.message}`);
-    return null;
-  }
 }
 
 function shouldAlert(now, lastAC, alertDate) {
@@ -98,12 +130,30 @@ function shouldAlert(now, lastAC, alertDate) {
     return false;
   }
   
-  if (lastAC < new Date(now).setDate(now.getDate() - 2)) {
+  const yesterday = new Date(now);
+  yesterday.setDate(now.getDate() - 1);
+  yesterday.setHours(0, 0, 0, 0);
+  if (lastAC < yesterday) {
     return false;
   }
 
   // 現在がアラート時間であれば、次のアラート時間を返す
   return getNextAlertTime(new Date(now));
+}
+
+function CompareDate(date1, date2) {
+  t1 = new Date(date1).getTime();
+  t2 = new Date(date2).getTime();
+
+  if (t1 == t2){
+    return 0;
+  }
+
+  if (t1 > t2){
+    return -1;
+  } else {
+    return 1;
+  }
 }
 
 function isSameDay(date1, date2) {
